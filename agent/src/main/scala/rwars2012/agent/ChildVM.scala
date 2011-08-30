@@ -1,6 +1,9 @@
 package rwars2012.agent
 
-import java.io.File
+import java.io.{File, StringWriter}
+import java.nio.{ByteBuffer, CharBuffer}
+import java.nio.channels.{Channels, ReadableByteChannel, SelectableChannel, Selector}
+import java.nio.charset.Charset
 import java.util.concurrent.{BrokenBarrierException, CyclicBarrier, Semaphore}
 import com.sun.jdi.{Bootstrap, ThreadReference, VirtualMachine}
 import com.sun.jdi.connect.Connector.{BooleanArgument, StringArgument}
@@ -16,29 +19,33 @@ object ProcessStream extends Enumeration {
 }
 
 class ChildVMSupervisor {
+    val log = Logger(getClass)
+
     private var barrier: CyclicBarrier = null
     private var childVMs: Map[Int, ChildVM] = Map.empty
     private var nextId: Int = 0
-    private val selector: Selector = Selector.open()
+    protected[agent] val selector: Selector = Selector.open()
 
-    protected[agent] def converge: Unit = 
+    protected[agent] def converge(): Unit = {
+        val b = synchronized(barrier)
         try {
-            barrier.await()
+            b.await()
         } catch {
-            case (_: BrokenBarrierException) => converge
+            case (_: BrokenBarrierException) => converge()
         }
+    }
 
     private val thread = new Thread(toString + " Thread") {
         override def run(): Unit = {
             selector.select(0)
-            val iter = selector.selectedKeys
+            val iter = selector.selectedKeys.iterator
             while (iter.hasNext) {
-                val key = iter.next
-                val (id, which) = key.attachment.asInstanceOf[(Int, ProcessStream#Value)]
+                val key = iter.next()
+                val (id, which) = key.attachment.asInstanceOf[(Int, ProcessStream.Value)]
 
                 childVMs.get(id) match {
                     case Some(childVM) if key.isReadable => childVM.acceptInput(which, key.channel)
-                    case None if key.isReadable => logger.debug("Ignoring input for child #" + id)
+                    case None if key.isReadable => log.debug("Ignoring input for child #" + id)
                     case _ => {}
                 }
 
@@ -50,18 +57,28 @@ class ChildVMSupervisor {
     }
     thread.start()
 
-    def add(label: String, parameters: VMParameters): Unit =
-        synchronized {
-            val newVM = new ChildVM(this, id, label, parameters)
-            childVMs ::= newVM
-            if (barrier != null) barrier.reset()
-            barrier = new CyclicBarrier(childVMs.length)
-        }
-
-    private def reset = {
+    private def rebuildBarrier(newSize: Int): Unit = {
+        if (barrier != null) barrier.reset()
+        barrier = new CyclicBarrier(newSize)
     }
 
-    reset
+    def add(label: String, parameters: VMParameters): ChildVM =
+        synchronized {
+            rebuildBarrier(childVMs.size+1)
+            val newVM = new ChildVM(this, nextId, label, parameters)
+            childVMs += nextId -> newVM
+            nextId += 1
+            newVM
+        }
+
+    def remove(childVM: ChildVM): Unit = 
+        synchronized {
+            if (childVMs contains childVM.id) {
+                rebuildBarrier(childVMs.size - 1)
+                childVMs -= childVM.id
+                childVM.unregister()
+            }
+        }
 }
 
 case class VMParameters(targetMainClass: String, targetJARs: Set[String], cpuShare: Int, maxHeap: Long, maxStack: Int)
@@ -84,6 +101,20 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
         args("main").asInstanceOf[StringArgument].setValue("rwars2012.agent.childVM.Rig")
         connector.launch(arguments)
     }
+
+    val (stdoutSelectorKey, stderrSelectorKey) =
+        (Channels.newChannel(virtualMachine.process.getInputStream).register(supervisor.selector, SelectionKey.OP_READ, (id, ProcessStream.STDOUT)),
+         Channels.newChannel(virtualMachine.process.getErrorStream).register(supervisor.selector, SelectionKey.OP_READ, (id, ProcessStream.STDERR)));
+
+    log.info("#" + id + " " + label + ": Registered.")
+
+    protected[agent] def unregister(): Unit = {
+        stdoutSelectorKey.cancel()
+        stderrSelectorKey.cancel()
+        virtualMachine.exit(0)
+        log.info("#" + id + " " + label + ": Unregistered.")
+    }
+
     val vmDeathRequest = virtualMachine.eventRequestManager.createVMDeathRequest()
     val vmThreadStartRequest = virtualMachine.eventRequestManager.createThreadStartRequest()
     val vmThreadDeathRequest = virtualMachine.eventRequestManager.createThreadDeathRequest()
@@ -122,6 +153,59 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
         case Some(th) => {
             synchronized { wait() }
             waitForDeath()
+        }
+    }
+
+    private val stdoutBuffer = new StringWriter()
+    private val stderrBuffer = new StringWriter()
+    private val byteBuffer = ByteBuffer.allocate(1024)
+    private val chars = Array.ofDim[Char](1024)
+    private val charBuffer = CharBuffer.wrap(chars)
+
+    private val stdoutCharsetDecoder = Charset.defaultCharset.newDecoder()
+    private val stderrCharsetDecoder = Charset.defaultCharset.newDecoder()
+    
+    protected[agent] def acceptInput(which: ProcessStream.Value, channel: SelectableChannel) = {
+        val (buffer, decoder, output) = which match {
+            case ProcessStream.STDOUT => (stdoutBuffer, stdoutCharsetDecoder, (s: String) => log.info(label + ": " + s));
+            case ProcessStream.STDERR => (stderrBuffer, stderrCharsetDecoder, (s: String) => log.error(label + ": " + s));
+        }
+
+        channel match {
+            case (rbc: ReadableByteChannel) => {
+                def processInput(): Unit = {
+                    byteBuffer.clear()
+                    charBuffer.clear()
+                    rbc.read(byteBuffer) match {
+                        case -1 => {
+                            decoder.decode(byteBuffer, charBuffer, true)
+                            decoder.flush(charBuffer)
+                            buffer.write(chars, 0, charBuffer.remaining)
+                        }
+
+                        case n => {
+                            byteBuffer.rewind()
+                            decoder.decode(byteBuffer, charBuffer, false)
+                            buffer.write(chars, 0, charBuffer.remaining)
+                            processInput()
+                        }
+                    }
+                }
+                processInput()
+
+                def readLines(from: Int): Unit =
+                    buffer.getBuffer.indexOf("\n", from) match {
+                        case -1 => buffer.getBuffer.delete(0, from)
+                        case n if n >= 0 => {
+                            output(buffer.getBuffer.substring(0, n))
+                            readLines(from + 1)
+                        }
+                    }
+                readLines(0)
+            }
+
+            case other =>
+                log.error("Unknown channel subclass with " + other)
         }
     }
 
