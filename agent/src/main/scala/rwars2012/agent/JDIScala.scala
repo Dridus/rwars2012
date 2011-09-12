@@ -1,11 +1,32 @@
 package rwars2012.agent
 
-import com.sun.jdi.{Location, ThreadReference}
-import com.sun.jdi.event.{Event, StepEvent, ThreadDeathEvent, ThreadStartEvent, VMDeathEvent, VMStartEvent}
+import com.sun.jdi.{Location, ReferenceType, ThreadReference}
+import com.sun.jdi.event.{
+    Event, 
+    ClassPrepareEvent,
+    MethodEntryEvent,
+    StepEvent,
+    ThreadDeathEvent, ThreadStartEvent,
+    VMDeathEvent, VMStartEvent
+}
 
 object Step {
     def unapply(in: Event): Option[(ThreadReference, Location)] = in match {
         case (step: StepEvent) => Some((step.thread, step.location))
+        case _ => None
+    }
+}
+
+object ClassPrepare {
+    def unapply(in: Event): Option[ReferenceType] = in match {
+        case (classPrepare: ClassPrepareEvent) => Some(classPrepare.referenceType)
+        case _ => None
+    }
+}
+
+object MethodEntry {
+    def unapply(in: Event): Option[(ThreadReference, com.sun.jdi.Method)] = in match {
+        case (methodEntry: MethodEntryEvent) => Some(methodEntry.thread, methodEntry.method)
         case _ => None
     }
 }
