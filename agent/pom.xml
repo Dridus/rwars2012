@@ -24,6 +24,17 @@
             <plugin>
                 <groupId>org.scala-tools</groupId>
                 <artifactId>maven-scala-plugin</artifactId>
+                <configuration>
+                    <launchers>
+                        <launcher>
+                            <id>agent</id>
+                            <args>
+                                <arg>test.cfg</arg>
+                            </args>
+                            <mainClass>rwars2012.agent.Test</mainClass>
+                        </launcher>
+                    </launchers>
+                </configuration>
             </plugin>
         </plugins>
     </build>
@@ -31,5 +42,7 @@
     <dependencies>
         <dependency><groupId>net.lag</groupId><artifactId>configgy</artifactId></dependency>
         <dependency><groupId>org.scala-lang</groupId><artifactId>scala-library</artifactId></dependency>
+        <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId></dependency>
+        <dependency><groupId>ch.qos.logback</groupId><artifactId>logback-classic</artifactId></dependency>
     </dependencies>
 </project>
