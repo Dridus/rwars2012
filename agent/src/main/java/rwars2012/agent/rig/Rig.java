@@ -93,6 +93,8 @@ class Rig {
             Thread[] activeThreads = null;
 
             while (true) {
+                //System.out.println("monitoring cpu");
+
                 if (activeThreads == null) {
                     activeThreads = new Thread[payloadThreads.activeCount() + 5];
                 }

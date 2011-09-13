@@ -19,48 +19,40 @@ object ProcessStream extends Enumeration {
 class ChildVMSupervisor(val quantum: Long) {
     val log = Logger(getClass)
 
-    private var barrier: CyclicBarrier = new CyclicBarrier(1)
+    private var barrier: CyclicBarrier = null
     private var childVMs: Map[Int, ChildVM] = Map.empty
     private var nextId: Int = 0
-
-    private val supervisorThread = new Thread("ChildVM Supervisor " + System.identityHashCode(this)) {
-        setDaemon(true)
-
-        override def run() =
-            while (true) {
-                val b = synchronized(barrier)
-                try {
-                    b.await()
-                } catch {
-                    case (_: BrokenBarrierException) => {
-                        log.debug("barrier broken")
-                        run()
-                    }
-                }
-
-                log.debug("barrier converged")
-            }
-    }
-
-    supervisorThread.start()
 
     protected[agent] def converge(): Unit = {
         val b = synchronized(barrier)
         try {
+            log.trace("waiting on barrier " + b)
             b.await()
         } catch {
-            case (_: BrokenBarrierException) => converge()
+            case (_: BrokenBarrierException) => {
+                log.debug("Barrier broken, re-converging")
+                converge()
+            }
         }
     }
 
-    private def rebuildBarrier(newChildCount: Int): Unit = {
-        barrier.reset()
-        barrier = new CyclicBarrier(newChildCount + 1)
-    }
+    private def rebuildBarrier(newChildCount: Int): Unit =
+        synchronized {
+            if (barrier != null) barrier.reset()
+            
+            barrier = 
+                if (newChildCount == 0) null
+                else new CyclicBarrier(newChildCount, new Runnable {
+                    override def run() = log.trace("Barrier converged")
+                })
+
+            log.debug("rebuilding barrier for " + newChildCount)
+            notifyAll()
+        }
 
     def add(label: String, parameters: VMParameters): ChildVM =
         synchronized {
-            rebuildBarrier(childVMs.size+1)
+            rebuildBarrier(childVMs.size + 1)
             val newVM = new ChildVM(this, nextId, label, parameters)
             childVMs += nextId -> newVM
             nextId += 1
@@ -108,10 +100,11 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
 
     var vmThreads: Map[ThreadReference, String] = Map.empty
 
-    protected[agent] def kill(): Unit = {
-        virtualMachine.exit(0)
-        log.info("Killed.")
-    }
+    protected[agent] def kill(): Unit =
+        if (synchronized(_monitor).isDefined) {
+            virtualMachine.exit(0)
+            log.info("Killed.")
+        }
 
     private val stdoutStreamMonitor =
         new StreamLogger("stdout", virtualMachine.process.getInputStream, s => log.info("stdout: " + s))
@@ -131,7 +124,7 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
     classPrepareRequest.enable()
 
     private var _stableTime: Long = 0
-    private var _exitCode: Int = 0
+    private var _exitCode: Option[Int] = None
     private var _monitor: Option[Monitor] = None
 
     private var _payloadThreadGroup: Option[ThreadGroupReference] = None
@@ -155,19 +148,6 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
         }
     }
 
-    def stop(): Unit = synchronized {
-        _monitor match {
-            case Some(th) => {
-                _monitor = None
-                notifyAll()
-                th.interrupt()
-                log.info("Stopping VM with parameters: " + parameters)
-            }
-
-            case None => sys.error("VM already stopped")
-        }
-    }
-
     def waitForDeath(): Unit = synchronized {
         _monitor match {
             case None => log.debug("VM finished")
@@ -180,11 +160,6 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
     }
 
     private def clearMonitor(): Unit = synchronized {
-        log.debug("clearing monitor")
-        _monitor = None
-        notifyAll()
-        try { stdoutStreamMonitor.interrupt() } catch { case ex => log.debug("couldn't interrupt stdout:", ex) }
-        try { stderrStreamMonitor.interrupt() } catch { case ex => log.debug("couldn't interrupt stderr:", ex) }
     }
 
     sealed abstract class EventProcessingResult
@@ -256,7 +231,6 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
 
                     case VMDeath() => {
                         log.info("VM dying - monitor exiting")
-                        clearMonitor()
                         events.resume()
                         return MonitorFinished
                     }
@@ -264,6 +238,11 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
                     case VMStart(vmThread) => {
                         log.info("VM started with initial thread: " + vmThread.name)
                         _stableTime = System.currentTimeMillis
+                    }
+
+                    case VMDisconnect() => {
+                        log.info("VM disconnected")
+                        return MonitorFinished
                     }
 
                     case _ => log.trace("ignoring " + event)
@@ -288,6 +267,14 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
                         }
 
                     handleEvents(supervisor.quantum) match {
+                        case _ if !ChildVM.this.synchronized(_monitor).isDefined => {}
+                        case MonitorFinished =>
+                            ChildVM.this.synchronized {
+                                log.debug("clearing monitor")
+                                _monitor = None
+                                ChildVM.this.notifyAll()
+                            }
+
                         case EventsProcessed(events) => {
                             convergeIfNeeded()
                             log.trace("Resuming via EventSet")
@@ -299,28 +286,24 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
                             log.trace("Resuming the virtual machine")
                             virtualMachine.resume()
                         }
-                        
-                        case MonitorFinished => {}
                     }
                 } catch {
                     case (ie: InterruptedException) => {}
-                    case (ex: Exception) => {
-                        log.error("Monitor dying: ", ex)
-                        clearMonitor()
-                        return
-                    }
+                    case (ex: Exception) => log.error("Monitor dying: ", ex)
                 }
             }
 
-            clearMonitor()
+            try { stdoutStreamMonitor.interrupt() } catch { case ex => log.debug("couldn't interrupt stdout:", ex) }
+            try { stderrStreamMonitor.interrupt() } catch { case ex => log.debug("couldn't interrupt stderr:", ex) }
+            supervisor.remove(ChildVM.this)
 
             log.debug("Waiting for VM process to exit")
-            _exitCode = virtualMachine.process.waitFor()
-            if (_exitCode == 0) {
+            _exitCode = Some(virtualMachine.process.waitFor())
+            if (_exitCode.get == 0) {
                 log.info("Virtual machine exited with success after running for " +
                          (System.currentTimeMillis - _stableTime) + "ms")
             } else {
-                log.warn("Virtual machine exited with code " + _exitCode + " after running for " +
+                log.warn("Virtual machine exited with code " + _exitCode.get + " after running for " +
                          (System.currentTimeMillis - _stableTime) + "ms")
             }
         }
@@ -340,8 +323,6 @@ class ChildVM protected[agent] (supervisor: ChildVMSupervisor, val id: Int, val 
                 }
             } catch {
                 case ex => log.info("Died:", ex)
-            } finally {
-                log.debug("Finished.")
             }
     }
 }

@@ -7,7 +7,7 @@ import com.sun.jdi.event.{
     MethodEntryEvent,
     StepEvent,
     ThreadDeathEvent, ThreadStartEvent,
-    VMDeathEvent, VMStartEvent
+    VMDeathEvent, VMStartEvent, VMDisconnectEvent
 }
 
 object Step {
@@ -54,4 +54,8 @@ object VMStart {
         case (vmStart: VMStartEvent) => Some(vmStart.thread)
         case _ => None
     }
+}
+
+object VMDisconnect {
+    def unapply(in: Event): Boolean = in.isInstanceOf[VMDisconnectEvent]
 }
